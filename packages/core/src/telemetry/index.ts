@@ -7,6 +7,7 @@
 export enum TelemetryTarget {
   GCP = 'gcp',
   LOCAL = 'local',
+  QWEN = 'qwen',
 }
 
 const DEFAULT_TELEMETRY_TARGET = TelemetryTarget.LOCAL;
@@ -26,6 +27,7 @@ export {
   logApiError,
   logApiResponse,
   logFlashFallback,
+  logSlashCommand,
 } from './loggers.js';
 export {
   StartSessionEvent,
@@ -37,6 +39,7 @@ export {
   ApiResponseEvent,
   TelemetryEvent,
   FlashFallbackEvent,
+  SlashCommandEvent,
 } from './types.js';
 export { SpanStatusCode, ValueType } from '@opentelemetry/api';
 export { SemanticAttributes } from '@opentelemetry/semantic-conventions';

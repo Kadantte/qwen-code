@@ -41,11 +41,11 @@ export const WORKSPACE_SETTINGS_FILE = path.join(
 export function getJson(url) {
   const tmpFile = path.join(
     os.tmpdir(),
-    `gemini-cli-releases-${Date.now()}.json`,
+    `qwen-code-releases-${Date.now()}.json`,
   );
   try {
     execSync(
-      `curl -sL -H "User-Agent: gemini-cli-dev-script" -o "${tmpFile}" "${url}"`,
+      `curl -sL -H "User-Agent: qwen-code-dev-script" -o "${tmpFile}" "${url}"`,
       { stdio: 'pipe' },
     );
     const content = fs.readFileSync(tmpFile, 'utf-8');
@@ -109,6 +109,32 @@ export function readJsonFile(filePath) {
 
 export function writeJsonFile(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+export function moveBinary(source, destination) {
+  try {
+    fs.renameSync(source, destination);
+  } catch (error) {
+    if (error.code !== 'EXDEV') {
+      throw error;
+    }
+    // Handle a cross-device error: copy-to-temp-then-rename.
+    const destDir = path.dirname(destination);
+    const destFile = path.basename(destination);
+    const tempDest = path.join(destDir, `${destFile}.tmp`);
+
+    try {
+      fs.copyFileSync(source, tempDest);
+      fs.renameSync(tempDest, destination);
+    } catch (moveError) {
+      // If copy or rename fails, clean up the intermediate temp file.
+      if (fs.existsSync(tempDest)) {
+        fs.unlinkSync(tempDest);
+      }
+      throw moveError;
+    }
+    fs.unlinkSync(source);
+  }
 }
 
 export function waitForPort(port, timeout = 10000) {
@@ -216,9 +242,7 @@ export async function ensureBinary(
   }
 
   const downloadUrl = asset.browser_download_url;
-  const tmpDir = fs.mkdtempSync(
-    path.join(os.tmpdir(), 'gemini-cli-telemetry-'),
-  );
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-code-telemetry-'));
   const archivePath = path.join(tmpDir, asset.name);
 
   try {
@@ -248,7 +272,7 @@ export async function ensureBinary(
       );
     }
 
-    fs.renameSync(foundBinaryPath, executablePath);
+    moveBinary(foundBinaryPath, executablePath);
 
     if (platform !== 'windows') {
       fs.chmodSync(executablePath, '755');

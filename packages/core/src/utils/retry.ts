@@ -8,7 +8,13 @@ import { AuthType } from '../core/contentGenerator.js';
 import {
   isProQuotaExceededError,
   isGenericQuotaExceededError,
+  isQwenQuotaExceededError,
+  isQwenThrottlingError,
 } from './quotaErrorDetection.js';
+
+export interface HttpError extends Error {
+  status?: number;
+}
 
 export interface RetryOptions {
   maxAttempts: number;
@@ -146,9 +152,23 @@ export async function retryWithBackoff<T>(
         }
       }
 
-      // Track consecutive 429 errors
+      // Check for Qwen OAuth quota exceeded error - throw immediately without retry
+      if (authType === AuthType.QWEN_OAUTH && isQwenQuotaExceededError(error)) {
+        throw new Error(
+          `Qwen API quota exceeded: Your Qwen API quota has been exhausted. Please wait for your quota to reset.`,
+        );
+      }
+
+      // Track consecutive 429 errors, but handle Qwen throttling differently
       if (errorStatus === 429) {
-        consecutive429Count++;
+        // For Qwen throttling errors, we still want to track them for exponential backoff
+        // but not for quota fallback logic (since Qwen doesn't have model fallback)
+        if (authType === AuthType.QWEN_OAUTH && isQwenThrottlingError(error)) {
+          // Keep track of 429s but reset the consecutive count to avoid fallback logic
+          consecutive429Count = 0;
+        } else {
+          consecutive429Count++;
+        }
       } else {
         consecutive429Count = 0;
       }
@@ -196,7 +216,7 @@ export async function retryWithBackoff<T>(
         // Reset currentDelay for next potential non-429 error, or if Retry-After is not present next time
         currentDelay = initialDelayMs;
       } else {
-        // Fallback to exponential backoff with jitter
+        // Fall back to exponential backoff with jitter
         logRetryAttempt(attempt, error, errorStatus);
         // Add jitter: +/- 30% of currentDelay
         const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
@@ -216,7 +236,7 @@ export async function retryWithBackoff<T>(
  * @param error The error object.
  * @returns The HTTP status code, or undefined if not found.
  */
-function getErrorStatus(error: unknown): number | undefined {
+export function getErrorStatus(error: unknown): number | undefined {
   if (typeof error === 'object' && error !== null) {
     if ('status' in error && typeof error.status === 'number') {
       return error.status;

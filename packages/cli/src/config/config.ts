@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+import { homedir } from 'node:os';
 import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
 import process from 'node:process';
@@ -15,13 +18,15 @@ import {
   ApprovalMode,
   DEFAULT_GEMINI_MODEL,
   DEFAULT_GEMINI_EMBEDDING_MODEL,
+  DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
   FileDiscoveryService,
   TelemetryTarget,
-  MCPServerConfig,
+  FileFilteringOptions,
+  IdeClient,
 } from '@qwen-code/qwen-code-core';
 import { Settings } from './settings.js';
 
-import { Extension, filterActiveExtensions } from './extension.js';
+import { Extension, annotateActiveExtensions } from './extension.js';
 import { getCliVersion } from '../utils/version.js';
 import { loadSandboxConfig } from './sandboxConfig.js';
 
@@ -52,13 +57,17 @@ export interface CliArgs {
   telemetryTarget: string | undefined;
   telemetryOtlpEndpoint: string | undefined;
   telemetryLogPrompts: boolean | undefined;
+  telemetryOutfile: string | undefined;
   allowedMcpServerNames: string[] | undefined;
+  experimentalAcp: boolean | undefined;
   extensions: string[] | undefined;
   listExtensions: boolean | undefined;
-  ideMode: boolean | undefined;
+  ideModeFeature: boolean | undefined;
   openaiLogging: boolean | undefined;
   openaiApiKey: string | undefined;
   openaiBaseUrl: string | undefined;
+  proxy: string | undefined;
+  includeDirectories: string[] | undefined;
 }
 
 export async function parseArguments(): Promise<CliArgs> {
@@ -72,7 +81,7 @@ export async function parseArguments(): Promise<CliArgs> {
       alias: 'm',
       type: 'string',
       description: `Model`,
-      default: process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+      default: process.env.GEMINI_MODEL,
     })
     .option('prompt', {
       alias: 'p',
@@ -157,11 +166,19 @@ export async function parseArguments(): Promise<CliArgs> {
       description:
         'Enable or disable logging of user prompts for telemetry. Overrides settings files.',
     })
+    .option('telemetry-outfile', {
+      type: 'string',
+      description: 'Redirect all telemetry output to the specified file.',
+    })
     .option('checkpointing', {
       alias: 'c',
       type: 'boolean',
       description: 'Enables checkpointing of file edits',
       default: false,
+    })
+    .option('experimental-acp', {
+      type: 'boolean',
+      description: 'Starts the agent in ACP mode',
     })
     .option('allowed-mcp-server-names', {
       type: 'array',
@@ -180,7 +197,7 @@ export async function parseArguments(): Promise<CliArgs> {
       type: 'boolean',
       description: 'List all available extensions and exit.',
     })
-    .option('ide-mode', {
+    .option('ide-mode-feature', {
       type: 'boolean',
       description: 'Run in IDE mode?',
     })
@@ -197,7 +214,20 @@ export async function parseArguments(): Promise<CliArgs> {
       type: 'string',
       description: 'OpenAI base URL (for custom endpoints)',
     })
-
+    .option('proxy', {
+      type: 'string',
+      description:
+        'Proxy for gemini client, like schema://user:password@host:port',
+    })
+    .option('include-directories', {
+      type: 'array',
+      string: true,
+      description:
+        'Additional directories to include in the workspace (comma-separated or multiple --include-directories)',
+      coerce: (dirs: string[]) =>
+        // Handle comma-separated values
+        dirs.flatMap((dir) => dir.split(',').map((d) => d.trim())),
+    })
     .version(await getCliVersion()) // This will enable the --version flag based on package.json
     .alias('v', 'version')
     .help()
@@ -213,7 +243,11 @@ export async function parseArguments(): Promise<CliArgs> {
     });
 
   yargsInstance.wrap(yargsInstance.terminalWidth());
-  return yargsInstance.argv;
+  const result = yargsInstance.parseSync();
+
+  // The import format is now only controlled by settings.memoryImportFormat
+  // We no longer accept it as a CLI argument
+  return result as CliArgs;
 }
 
 // This function is now a thin wrapper around the server's implementation.
@@ -223,20 +257,35 @@ export async function loadHierarchicalGeminiMemory(
   currentWorkingDirectory: string,
   debugMode: boolean,
   fileService: FileDiscoveryService,
+  settings: Settings,
   extensionContextFilePaths: string[] = [],
+  memoryImportFormat: 'flat' | 'tree' = 'tree',
+  fileFilteringOptions?: FileFilteringOptions,
 ): Promise<{ memoryContent: string; fileCount: number }> {
+  // FIX: Use real, canonical paths for a reliable comparison to handle symlinks.
+  const realCwd = fs.realpathSync(path.resolve(currentWorkingDirectory));
+  const realHome = fs.realpathSync(path.resolve(homedir()));
+  const isHomeDirectory = realCwd === realHome;
+
+  // If it is the home directory, pass an empty string to the core memory
+  // function to signal that it should skip the workspace search.
+  const effectiveCwd = isHomeDirectory ? '' : currentWorkingDirectory;
+
   if (debugMode) {
     logger.debug(
-      `CLI: Delegating hierarchical memory load to server for CWD: ${currentWorkingDirectory}`,
+      `CLI: Delegating hierarchical memory load to server for CWD: ${currentWorkingDirectory} (memoryImportFormat: ${memoryImportFormat})`,
     );
   }
-  // Directly call the server function.
-  // The server function will use its own homedir() for the global path.
+
+  // Directly call the server function with the corrected path.
   return loadServerHierarchicalMemory(
-    currentWorkingDirectory,
+    effectiveCwd,
     debugMode,
     fileService,
     extensionContextFilePaths,
+    memoryImportFormat,
+    fileFilteringOptions,
+    settings.memoryDiscoveryMaxDirs,
   );
 }
 
@@ -250,18 +299,25 @@ export async function loadCliConfig(
     argv.debug ||
     [process.env.DEBUG, process.env.DEBUG_MODE].some(
       (v) => v === 'true' || v === '1',
-    );
+    ) ||
+    false;
+  const memoryImportFormat = settings.memoryImportFormat || 'tree';
+  const ideMode = settings.ideMode ?? false;
 
-  const ideMode =
-    (argv.ideMode ?? settings.ideMode ?? false) &&
-    process.env.TERM_PROGRAM === 'vscode' &&
+  const ideModeFeature =
+    (argv.ideModeFeature ?? settings.ideModeFeature ?? false) &&
     !process.env.SANDBOX;
 
-  const activeExtensions = filterActiveExtensions(
+  const ideClient = IdeClient.getInstance(ideMode && ideModeFeature);
+
+  const allExtensions = annotateActiveExtensions(
     extensions,
     argv.extensions || [],
   );
 
+  const activeExtensions = extensions.filter(
+    (_, i) => allExtensions[i].isActive,
+  );
   // Handle OpenAI API key from command line
   if (argv.openaiApiKey) {
     process.env.OPENAI_API_KEY = argv.openaiApiKey;
@@ -288,44 +344,71 @@ export async function loadCliConfig(
   );
 
   const fileService = new FileDiscoveryService(process.cwd());
+
+  const fileFiltering = {
+    ...DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
+    ...settings.fileFiltering,
+  };
+
   // Call the (now wrapper) loadHierarchicalGeminiMemory which calls the server's version
   const { memoryContent, fileCount } = await loadHierarchicalGeminiMemory(
     process.cwd(),
     debugMode,
     fileService,
+    settings,
     extensionContextFilePaths,
+    memoryImportFormat,
+    fileFiltering,
   );
 
   let mcpServers = mergeMcpServers(settings, activeExtensions);
   const excludeTools = mergeExcludeTools(settings, activeExtensions);
+  const blockedMcpServers: Array<{ name: string; extensionName: string }> = [];
+
+  if (!argv.allowedMcpServerNames) {
+    if (settings.allowMCPServers) {
+      const allowedNames = new Set(settings.allowMCPServers.filter(Boolean));
+      if (allowedNames.size > 0) {
+        mcpServers = Object.fromEntries(
+          Object.entries(mcpServers).filter(([key]) => allowedNames.has(key)),
+        );
+      }
+    }
+
+    if (settings.excludeMCPServers) {
+      const excludedNames = new Set(settings.excludeMCPServers.filter(Boolean));
+      if (excludedNames.size > 0) {
+        mcpServers = Object.fromEntries(
+          Object.entries(mcpServers).filter(([key]) => !excludedNames.has(key)),
+        );
+      }
+    }
+  }
 
   if (argv.allowedMcpServerNames) {
     const allowedNames = new Set(argv.allowedMcpServerNames.filter(Boolean));
     if (allowedNames.size > 0) {
       mcpServers = Object.fromEntries(
-        Object.entries(mcpServers).filter(([key]) => allowedNames.has(key)),
+        Object.entries(mcpServers).filter(([key, server]) => {
+          const isAllowed = allowedNames.has(key);
+          if (!isAllowed) {
+            blockedMcpServers.push({
+              name: key,
+              extensionName: server.extensionName || '',
+            });
+          }
+          return isAllowed;
+        }),
       );
     } else {
+      blockedMcpServers.push(
+        ...Object.entries(mcpServers).map(([key, server]) => ({
+          name: key,
+          extensionName: server.extensionName || '',
+        })),
+      );
       mcpServers = {};
     }
-  }
-
-  if (ideMode) {
-    mcpServers['_ide_server'] = new MCPServerConfig(
-      undefined, // command
-      undefined, // args
-      undefined, // env
-      undefined, // cwd
-      undefined, // url
-      'http://localhost:3000/mcp', // httpUrl
-      undefined, // headers
-      undefined, // tcp
-      undefined, // timeout
-      false, // trust
-      'IDE connection', // description
-      undefined, // includeTools
-      undefined, // excludeTools
-    );
   }
 
   const sandboxConfig = await loadSandboxConfig(settings, argv);
@@ -335,6 +418,7 @@ export async function loadCliConfig(
     embeddingModel: DEFAULT_GEMINI_EMBEDDING_MODEL,
     sandbox: sandboxConfig,
     targetDir: process.cwd(),
+    includeDirectories: argv.includeDirectories,
     debugMode,
     question: argv.promptInteractive || argv.prompt || '',
     fullContext: argv.allFiles || argv.all_files || false,
@@ -362,16 +446,19 @@ export async function loadCliConfig(
         process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??
         settings.telemetry?.otlpEndpoint,
       logPrompts: argv.telemetryLogPrompts ?? settings.telemetry?.logPrompts,
+      outfile: argv.telemetryOutfile ?? settings.telemetry?.outfile,
     },
     usageStatisticsEnabled: settings.usageStatisticsEnabled ?? true,
     // Git-aware file filtering settings
     fileFiltering: {
       respectGitIgnore: settings.fileFiltering?.respectGitIgnore,
+      respectGeminiIgnore: settings.fileFiltering?.respectGeminiIgnore,
       enableRecursiveFileSearch:
         settings.fileFiltering?.enableRecursiveFileSearch,
     },
     checkpointing: argv.checkpointing || settings.checkpointing?.enabled,
     proxy:
+      argv.proxy ||
       process.env.HTTPS_PROXY ||
       process.env.https_proxy ||
       process.env.HTTP_PROXY ||
@@ -379,18 +466,20 @@ export async function loadCliConfig(
     cwd: process.cwd(),
     fileDiscoveryService: fileService,
     bugCommand: settings.bugCommand,
-    model: argv.model!,
+    model: argv.model || settings.model || DEFAULT_GEMINI_MODEL,
     extensionContextFilePaths,
     maxSessionTurns: settings.maxSessionTurns ?? -1,
-    sessionTokenLimit: settings.sessionTokenLimit ?? 32000,
+    sessionTokenLimit: settings.sessionTokenLimit ?? -1,
     maxFolderItems: settings.maxFolderItems ?? 20,
+    experimentalAcp: argv.experimentalAcp || false,
     listExtensions: argv.listExtensions || false,
-    activeExtensions: activeExtensions.map((e) => ({
-      name: e.config.name,
-      version: e.config.version,
-    })),
+    extensions: allExtensions,
+    blockedMcpServers,
     noBrowser: !!process.env.NO_BROWSER,
+    summarizeToolOutput: settings.summarizeToolOutput,
     ideMode,
+    ideModeFeature,
+    ideClient,
     enableOpenAILogging:
       (typeof argv.openaiLogging === 'undefined'
         ? settings.enableOpenAILogging
@@ -407,6 +496,7 @@ export async function loadCliConfig(
           'SYSTEM_TEMPLATE:{"name":"qwen3_coder","params":{"is_git_repository":{RUNTIME_VARS_IS_GIT_REPO},"sandbox":"{RUNTIME_VARS_SANDBOX}"}}',
       },
     ],
+    contentGenerator: settings.contentGenerator,
   });
 }
 
@@ -421,7 +511,10 @@ function mergeMcpServers(settings: Settings, extensions: Extension[]) {
           );
           return;
         }
-        mcpServers[key] = server;
+        mcpServers[key] = {
+          ...server,
+          extensionName: extension.config.name,
+        };
       },
     );
   }

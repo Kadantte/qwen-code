@@ -15,7 +15,9 @@ import {
   EVENT_TOOL_CALL,
   EVENT_USER_PROMPT,
   EVENT_FLASH_FALLBACK,
+  EVENT_NEXT_SPEAKER_CHECK,
   SERVICE_NAME,
+  EVENT_SLASH_COMMAND,
 } from './constants.js';
 import {
   ApiErrorEvent,
@@ -25,7 +27,9 @@ import {
   ToolCallEvent,
   UserPromptEvent,
   FlashFallbackEvent,
+  NextSpeakerCheckEvent,
   LoopDetectedEvent,
+  SlashCommandEvent,
 } from './types.js';
 import {
   recordApiErrorMetrics,
@@ -38,7 +42,8 @@ import { uiTelemetryService, UiEvent } from './uiTelemetry.js';
 import { ClearcutLogger } from './clearcut-logger/clearcut-logger.js';
 import { safeJsonStringify } from '../utils/safeJsonStringify.js';
 
-const shouldLogUserPrompts = (_config: Config): boolean => false; // 禁用用户提示日志
+const shouldLogUserPrompts = (config: Config): boolean =>
+  config.getTelemetryLogPromptsEnabled();
 
 function getCommonAttributes(config: Config): LogAttributes {
   return {
@@ -304,6 +309,48 @@ export function logLoopDetected(
   const logger = logs.getLogger(SERVICE_NAME);
   const logRecord: LogRecord = {
     body: `Loop detected. Type: ${event.loop_type}.`,
+    attributes,
+  };
+  logger.emit(logRecord);
+}
+
+export function logNextSpeakerCheck(
+  config: Config,
+  event: NextSpeakerCheckEvent,
+): void {
+  ClearcutLogger.getInstance(config)?.logNextSpeakerCheck(event);
+  if (!isTelemetrySdkInitialized()) return;
+
+  const attributes: LogAttributes = {
+    ...getCommonAttributes(config),
+    ...event,
+    'event.name': EVENT_NEXT_SPEAKER_CHECK,
+  };
+
+  const logger = logs.getLogger(SERVICE_NAME);
+  const logRecord: LogRecord = {
+    body: `Next speaker check.`,
+    attributes,
+  };
+  logger.emit(logRecord);
+}
+
+export function logSlashCommand(
+  config: Config,
+  event: SlashCommandEvent,
+): void {
+  ClearcutLogger.getInstance(config)?.logSlashCommandEvent(event);
+  if (!isTelemetrySdkInitialized()) return;
+
+  const attributes: LogAttributes = {
+    ...getCommonAttributes(config),
+    ...event,
+    'event.name': EVENT_SLASH_COMMAND,
+  };
+
+  const logger = logs.getLogger(SERVICE_NAME);
+  const logRecord: LogRecord = {
+    body: `Slash command: ${event.command}.`,
     attributes,
   };
   logger.emit(logRecord);

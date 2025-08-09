@@ -15,6 +15,7 @@ import {
   createUserContent,
   Part,
   GenerateContentResponseUsageMetadata,
+  Tool,
 } from '@google/genai';
 import { retryWithBackoff } from '../utils/retry.js';
 import { isFunctionResponse } from '../utils/messageInspectors.js';
@@ -25,10 +26,6 @@ import {
   logApiResponse,
   logApiError,
 } from '../telemetry/loggers.js';
-import {
-  getStructuredResponse,
-  getStructuredResponseFromParts,
-} from '../utils/generateContentResponseUtilities.js';
 import {
   ApiErrorEvent,
   ApiRequestEvent,
@@ -141,11 +138,7 @@ export class GeminiChat {
   }
 
   private _getRequestTextFromContents(contents: Content[]): string {
-    return contents
-      .flatMap((content) => content.parts ?? [])
-      .map((part) => part.text)
-      .filter(Boolean)
-      .join('');
+    return JSON.stringify(contents);
   }
 
   private async _logApiRequest(
@@ -201,13 +194,18 @@ export class GeminiChat {
   }
 
   /**
-   * Handles fallback to Flash model when persistent 429 errors occur for OAuth users.
-   * Uses a fallback handler if provided by the config, otherwise returns null.
+   * Handles falling back to Flash model when persistent 429 errors occur for OAuth users.
+   * Uses a fallback handler if provided by the config; otherwise, returns null.
    */
   private async handleFlashFallback(
     authType?: string,
     error?: unknown,
   ): Promise<string | null> {
+    // Handle different auth types
+    if (authType === AuthType.QWEN_OAUTH) {
+      return this.handleQwenOAuthError(error);
+    }
+
     // Only handle fallback for OAuth users
     if (authType !== AuthType.LOGIN_WITH_GOOGLE) {
       return null;
@@ -232,6 +230,7 @@ export class GeminiChat {
         );
         if (accepted !== false && accepted !== null) {
           this.config.setModel(fallbackModel);
+          this.config.setFallbackMode(true);
           return fallbackModel;
         }
         // Check if the model was switched manually in the handler
@@ -293,11 +292,14 @@ export class GeminiChat {
           );
         }
 
-        return this.contentGenerator.generateContent({
-          model: modelToUse,
-          contents: requestContents,
-          config: { ...this.generationConfig, ...params.config },
-        });
+        return this.contentGenerator.generateContent(
+          {
+            model: modelToUse,
+            contents: requestContents,
+            config: { ...this.generationConfig, ...params.config },
+          },
+          prompt_id,
+        );
       };
 
       response = await retryWithBackoff(apiCall, {
@@ -317,7 +319,7 @@ export class GeminiChat {
         durationMs,
         prompt_id,
         response.usageMetadata,
-        getStructuredResponse(response),
+        JSON.stringify(response),
       );
 
       this.sendPromise = (async () => {
@@ -400,11 +402,14 @@ export class GeminiChat {
           );
         }
 
-        return this.contentGenerator.generateContentStream({
-          model: modelToUse,
-          contents: requestContents,
-          config: { ...this.generationConfig, ...params.config },
-        });
+        return this.contentGenerator.generateContentStream(
+          {
+            model: modelToUse,
+            contents: requestContents,
+            config: { ...this.generationConfig, ...params.config },
+          },
+          prompt_id,
+        );
       };
 
       // Note: Retrying streams can be complex. If generateContentStream itself doesn't handle retries
@@ -498,6 +503,10 @@ export class GeminiChat {
     this.history = history;
   }
 
+  setTools(tools: Tool[]): void {
+    this.generationConfig.tools = tools;
+  }
+
   getFinalUsageMetadata(
     chunks: GenerateContentResponse[],
   ): GenerateContentResponseUsageMetadata | undefined {
@@ -549,12 +558,11 @@ export class GeminiChat {
           allParts.push(...content.parts);
         }
       }
-      const fullText = getStructuredResponseFromParts(allParts);
       await this._logApiResponse(
         durationMs,
         prompt_id,
         this.getFinalUsageMetadata(chunks),
-        fullText,
+        JSON.stringify(chunks),
       );
     }
     this.recordHistory(inputContent, outputContent);
@@ -670,5 +678,60 @@ export class GeminiChat {
       typeof content.parts[0].thought === 'boolean' &&
       content.parts[0].thought === true
     );
+  }
+
+  /**
+   * Handles Qwen OAuth authentication errors and rate limiting
+   */
+  private async handleQwenOAuthError(error?: unknown): Promise<string | null> {
+    if (!error) {
+      return null;
+    }
+
+    const errorMessage =
+      error instanceof Error
+        ? error.message.toLowerCase()
+        : String(error).toLowerCase();
+    const errorCode =
+      (error as { status?: number; code?: number })?.status ||
+      (error as { status?: number; code?: number })?.code;
+
+    // Check if this is an authentication/authorization error
+    const isAuthError =
+      errorCode === 401 ||
+      errorCode === 403 ||
+      errorMessage.includes('unauthorized') ||
+      errorMessage.includes('forbidden') ||
+      errorMessage.includes('invalid api key') ||
+      errorMessage.includes('authentication') ||
+      errorMessage.includes('access denied') ||
+      (errorMessage.includes('token') && errorMessage.includes('expired'));
+
+    // Check if this is a rate limiting error
+    const isRateLimitError =
+      errorCode === 429 ||
+      errorMessage.includes('429') ||
+      errorMessage.includes('rate limit') ||
+      errorMessage.includes('too many requests');
+
+    if (isAuthError) {
+      console.warn('Qwen OAuth authentication error detected:', errorMessage);
+      // The QwenContentGenerator should automatically handle token refresh
+      // If it still fails, it likely means the refresh token is also expired
+      console.log(
+        'Note: If this persists, you may need to re-authenticate with Qwen OAuth',
+      );
+      return null;
+    }
+
+    if (isRateLimitError) {
+      console.warn('Qwen API rate limit encountered:', errorMessage);
+      // For rate limiting, we don't need to do anything special
+      // The retry mechanism will handle the backoff
+      return null;
+    }
+
+    // For other errors, don't handle them specially
+    return null;
   }
 }
