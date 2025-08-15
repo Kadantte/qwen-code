@@ -11,142 +11,47 @@ import {
   ToolRegistry,
   shutdownTelemetry,
   isTelemetrySdkInitialized,
-  ToolResultDisplay,
+  GeminiEventType,
+  ToolErrorType,
 } from '@qwen-code/qwen-code-core';
-import {
-  Content,
-  Part,
-  FunctionCall,
-  GenerateContentResponse,
-} from '@google/genai';
+import { Content, Part, FunctionCall } from '@google/genai';
 
 import { parseAndFormatApiError } from './ui/utils/errorParsing.js';
-
-function getResponseText(response: GenerateContentResponse): string | null {
-  if (response.candidates && response.candidates.length > 0) {
-    const candidate = response.candidates[0];
-    if (
-      candidate.content &&
-      candidate.content.parts &&
-      candidate.content.parts.length > 0
-    ) {
-      // We are running in headless mode so we don't need to return thoughts to STDOUT.
-      const thoughtPart = candidate.content.parts[0];
-      if (thoughtPart?.thought) {
-        return null;
-      }
-      return candidate.content.parts
-        .filter((part) => part.text)
-        .map((part) => part.text)
-        .join('');
-    }
-  }
-  return null;
-}
-
-// Helper function to format tool call arguments for display
-function formatToolArgs(args: Record<string, unknown>): string {
-  if (!args || Object.keys(args).length === 0) {
-    return '(no arguments)';
-  }
-
-  const formattedArgs = Object.entries(args)
-    .map(([key, value]) => {
-      if (typeof value === 'string') {
-        return `${key}: "${value}"`;
-      } else if (typeof value === 'object' && value !== null) {
-        return `${key}: ${JSON.stringify(value)}`;
-      } else {
-        return `${key}: ${value}`;
-      }
-    })
-    .join(', ');
-
-  return `(${formattedArgs})`;
-}
-// Helper function to display tool call information
-function displayToolCallInfo(
-  toolName: string,
-  args: Record<string, unknown>,
-  status: 'start' | 'success' | 'error',
-  resultDisplay?: ToolResultDisplay,
-  errorMessage?: string,
-): void {
-  const timestamp = new Date().toLocaleTimeString();
-  const argsStr = formatToolArgs(args);
-
-  switch (status) {
-    case 'start':
-      process.stdout.write(
-        `\n[${timestamp}] 🔧 Executing tool: ${toolName} ${argsStr}\n`,
-      );
-      break;
-    case 'success':
-      if (resultDisplay) {
-        if (typeof resultDisplay === 'string' && resultDisplay.trim()) {
-          process.stdout.write(
-            `[${timestamp}] ✅ Tool ${toolName} completed successfully\n`,
-          );
-          process.stdout.write(`📋 Result:\n${resultDisplay}\n`);
-        } else if (
-          typeof resultDisplay === 'object' &&
-          'fileDiff' in resultDisplay
-        ) {
-          process.stdout.write(
-            `[${timestamp}] ✅ Tool ${toolName} completed successfully\n`,
-          );
-          process.stdout.write(`📋 File: ${resultDisplay.fileName}\n`);
-          process.stdout.write(`📋 Diff:\n${resultDisplay.fileDiff}\n`);
-        } else {
-          process.stdout.write(
-            `[${timestamp}] ✅ Tool ${toolName} completed successfully (no output)\n`,
-          );
-        }
-      } else {
-        process.stdout.write(
-          `[${timestamp}] ✅ Tool ${toolName} completed successfully (no output)\n`,
-        );
-      }
-      break;
-    case 'error':
-      process.stdout.write(
-        `[${timestamp}] ❌ Tool ${toolName} failed: ${errorMessage}\n`,
-      );
-      break;
-    default:
-      process.stdout.write(
-        `[${timestamp}] ⚠️ Tool ${toolName} reported unknown status: ${status}\n`,
-      );
-      break;
-  }
-}
+import { ConsolePatcher } from './ui/utils/ConsolePatcher.js';
 
 export async function runNonInteractive(
   config: Config,
   input: string,
   prompt_id: string,
 ): Promise<void> {
-  await config.initialize();
-  // Handle EPIPE errors when the output is piped to a command that closes early.
-  process.stdout.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EPIPE') {
-      // Exit gracefully if the pipe is closed.
-      process.exit(0);
-    }
+  const consolePatcher = new ConsolePatcher({
+    stderr: true,
+    debugMode: config.getDebugMode(),
   });
 
-  const geminiClient = config.getGeminiClient();
-  const toolRegistry: ToolRegistry = await config.getToolRegistry();
-
-  const chat = await geminiClient.getChat();
-  const abortController = new AbortController();
-  let currentMessages: Content[] = [{ role: 'user', parts: [{ text: input }] }];
-  let turnCount = 0;
   try {
+    await config.initialize();
+    consolePatcher.patch();
+    // Handle EPIPE errors when the output is piped to a command that closes early.
+    process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EPIPE') {
+        // Exit gracefully if the pipe is closed.
+        process.exit(0);
+      }
+    });
+
+    const geminiClient = config.getGeminiClient();
+    const toolRegistry: ToolRegistry = await config.getToolRegistry();
+
+    const abortController = new AbortController();
+    let currentMessages: Content[] = [
+      { role: 'user', parts: [{ text: input }] },
+    ];
+    let turnCount = 0;
     while (true) {
       turnCount++;
       if (
-        config.getMaxSessionTurns() > 0 &&
+        config.getMaxSessionTurns() >= 0 &&
         turnCount > config.getMaxSessionTurns()
       ) {
         console.error(
@@ -156,30 +61,28 @@ export async function runNonInteractive(
       }
       const functionCalls: FunctionCall[] = [];
 
-      const responseStream = await chat.sendMessageStream(
-        {
-          message: currentMessages[0]?.parts || [], // Ensure parts are always provided
-          config: {
-            abortSignal: abortController.signal,
-            tools: [
-              { functionDeclarations: toolRegistry.getFunctionDeclarations() },
-            ],
-          },
-        },
+      const responseStream = geminiClient.sendMessageStream(
+        currentMessages[0]?.parts || [],
+        abortController.signal,
         prompt_id,
       );
 
-      for await (const resp of responseStream) {
+      for await (const event of responseStream) {
         if (abortController.signal.aborted) {
           console.error('Operation cancelled.');
           return;
         }
-        const textPart = getResponseText(resp);
-        if (textPart) {
-          process.stdout.write(textPart);
-        }
-        if (resp.functionCalls) {
-          functionCalls.push(...resp.functionCalls);
+
+        if (event.type === GeminiEventType.Content) {
+          process.stdout.write(event.value);
+        } else if (event.type === GeminiEventType.ToolCallRequest) {
+          const toolCallRequest = event.value;
+          const fc: FunctionCall = {
+            name: toolCallRequest.name,
+            args: toolCallRequest.args,
+            id: toolCallRequest.callId,
+          };
+          functionCalls.push(fc);
         }
       }
 
@@ -196,9 +99,6 @@ export async function runNonInteractive(
             prompt_id,
           };
 
-          //Display tool call start information
-          displayToolCallInfo(fc.name as string, fc.args ?? {}, 'start');
-
           const toolResponse = await executeToolCall(
             config,
             requestInfo,
@@ -207,37 +107,11 @@ export async function runNonInteractive(
           );
 
           if (toolResponse.error) {
-            // Display tool call error information
-            const errorMessage =
-              typeof toolResponse.resultDisplay === 'string'
-                ? toolResponse.resultDisplay
-                : toolResponse.error?.message;
-
-            displayToolCallInfo(
-              fc.name as string,
-              fc.args ?? {},
-              'error',
-              undefined,
-              errorMessage,
-            );
-
-            const isToolNotFound = toolResponse.error.message.includes(
-              'not found in registry',
-            );
             console.error(
               `Error executing tool ${fc.name}: ${toolResponse.resultDisplay || toolResponse.error.message}`,
             );
-            if (!isToolNotFound) {
+            if (toolResponse.errorType === ToolErrorType.UNHANDLED_EXCEPTION)
               process.exit(1);
-            }
-          } else {
-            // Display tool call success information
-            displayToolCallInfo(
-              fc.name as string,
-              fc.args ?? {},
-              'success',
-              toolResponse.resultDisplay,
-            );
           }
 
           if (toolResponse.responseParts) {
@@ -268,6 +142,7 @@ export async function runNonInteractive(
     );
     process.exit(1);
   } finally {
+    consolePatcher.cleanup();
     if (isTelemetrySdkInitialized()) {
       await shutdownTelemetry();
     }

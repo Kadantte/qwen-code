@@ -12,6 +12,7 @@ import {
   ErroredToolCall,
   GeminiClient,
   ToolConfirmationOutcome,
+  ToolErrorType,
   ToolRegistry,
 } from '../index.js';
 import { logs } from '@opentelemetry/api-logs';
@@ -57,7 +58,6 @@ describe('loggers', () => {
   };
 
   beforeEach(() => {
-    vi.clearAllMocks(); // 清除之前测试的 mock 调用
     vi.spyOn(sdk, 'isTelemetrySdkInitialized').mockReturnValue(true);
     vi.spyOn(logs, 'getLogger').mockReturnValue(mockLogger);
     vi.spyOn(uiTelemetry.uiTelemetryService, 'addEvent').mockImplementation(
@@ -147,7 +147,7 @@ describe('loggers', () => {
           'event.name': EVENT_USER_PROMPT,
           'event.timestamp': '2025-01-01T00:00:00.000Z',
           prompt_length: 11,
-          // 移除 prompt 字段，因为 shouldLogUserPrompts 现在返回 false
+          prompt: 'test-prompt',
         },
       });
     });
@@ -212,6 +212,7 @@ describe('loggers', () => {
         toolUsePromptTokenCount: 2,
       };
       const event = new ApiResponseEvent(
+        'test-response-id',
         'test-model',
         100,
         'prompt-id-1',
@@ -229,6 +230,7 @@ describe('loggers', () => {
           'event.name': EVENT_API_RESPONSE,
           'event.timestamp': '2025-01-01T00:00:00.000Z',
           [SemanticAttributes.HTTP_STATUS_CODE]: 200,
+          response_id: 'test-response-id',
           model: 'test-model',
           status_code: 200,
           duration_ms: 100,
@@ -275,6 +277,7 @@ describe('loggers', () => {
         toolUsePromptTokenCount: 2,
       };
       const event = new ApiResponseEvent(
+        'test-response-id-2',
         'test-model',
         100,
         'prompt-id-1',
@@ -449,6 +452,7 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         tool: new EditTool(mockConfig),
         durationMs: 100,
@@ -512,6 +516,7 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         durationMs: 100,
         outcome: ToolConfirmationOutcome.Cancel,
@@ -575,6 +580,7 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         outcome: ToolConfirmationOutcome.ModifyWithEditor,
         tool: new EditTool(mockConfig),
@@ -639,6 +645,7 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         tool: new EditTool(mockConfig),
         durationMs: 100,
@@ -704,6 +711,7 @@ describe('loggers', () => {
             name: 'test-error-type',
             message: 'test-error',
           },
+          errorType: ToolErrorType.UNKNOWN,
         },
         durationMs: 100,
       };
@@ -730,8 +738,8 @@ describe('loggers', () => {
           success: false,
           error: 'test-error',
           'error.message': 'test-error',
-          error_type: 'test-error-type',
-          'error.type': 'test-error-type',
+          error_type: ToolErrorType.UNKNOWN,
+          'error.type': ToolErrorType.UNKNOWN,
           prompt_id: 'prompt-id-5',
         },
       });

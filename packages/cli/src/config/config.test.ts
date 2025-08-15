@@ -6,15 +6,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as os from 'os';
-import { loadCliConfig, parseArguments, CliArgs } from './config.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import { loadCliConfig, parseArguments } from './config.js';
 import { Settings } from './settings.js';
 import { Extension } from './extension.js';
 import * as ServerConfig from '@qwen-code/qwen-code-core';
-import {
-  TelemetryTarget,
-  ConfigParameters,
-  DEFAULT_TELEMETRY_TARGET,
-} from '@qwen-code/qwen-code-core';
 
 vi.mock('os', async (importOriginal) => {
   const actualOs = await importOriginal<typeof os>();
@@ -40,64 +37,28 @@ vi.mock('@qwen-code/qwen-code-core', async () => {
   );
   return {
     ...actualServer,
+    IdeClient: {
+      getInstance: vi.fn().mockReturnValue({
+        getConnectionStatus: vi.fn(),
+        initialize: vi.fn(),
+        shutdown: vi.fn(),
+      }),
+    },
     loadEnvironment: vi.fn(),
     loadServerHierarchicalMemory: vi.fn(
-      (cwd, debug, fileService, extensionPaths) =>
+      (cwd, dirs, debug, fileService, extensionPaths, _maxDirs) =>
         Promise.resolve({
           memoryContent: extensionPaths?.join(',') || '',
           fileCount: extensionPaths?.length || 0,
         }),
     ),
-    Config: class MockConfig extends actualServer.Config {
-      private enableOpenAILogging: boolean;
-
-      constructor(params: ConfigParameters) {
-        super(params);
-        this.enableOpenAILogging = params.enableOpenAILogging ?? false;
-      }
-
-      getEnableOpenAILogging(): boolean {
-        return this.enableOpenAILogging;
-      }
-
-      // Override other methods to ensure they work correctly
-      getShowMemoryUsage(): boolean {
-        return (
-          (this as unknown as { showMemoryUsage?: boolean }).showMemoryUsage ??
-          false
-        );
-      }
-
-      getTelemetryEnabled(): boolean {
-        return (
-          (this as unknown as { telemetrySettings?: { enabled?: boolean } })
-            .telemetrySettings?.enabled ?? false
-        );
-      }
-
-      getTelemetryLogPromptsEnabled(): boolean {
-        return (
-          (this as unknown as { telemetrySettings?: { logPrompts?: boolean } })
-            .telemetrySettings?.logPrompts ?? true
-        );
-      }
-
-      getTelemetryOtlpEndpoint(): string {
-        return (
-          (this as unknown as { telemetrySettings?: { otlpEndpoint?: string } })
-            .telemetrySettings?.otlpEndpoint ?? 'http://localhost:4317'
-        );
-      }
-
-      getTelemetryTarget(): TelemetryTarget {
-        return (
-          (
-            this as unknown as {
-              telemetrySettings?: { target?: TelemetryTarget };
-            }
-          ).telemetrySettings?.target ?? DEFAULT_TELEMETRY_TARGET
-        );
-      }
+    DEFAULT_MEMORY_FILE_FILTERING_OPTIONS: {
+      respectGitIgnore: false,
+      respectGeminiIgnore: true,
+    },
+    DEFAULT_FILE_FILTERING_OPTIONS: {
+      respectGitIgnore: true,
+      respectGeminiIgnore: true,
     },
   };
 });
@@ -242,6 +203,85 @@ describe('loadCliConfig', () => {
     const settings: Settings = { showMemoryUsage: false };
     const config = await loadCliConfig(settings, [], 'test-session', argv);
     expect(config.getShowMemoryUsage()).toBe(true);
+  });
+
+  it(`should leave proxy to empty by default`, async () => {
+    // Clear all proxy environment variables to ensure clean test
+    delete process.env.https_proxy;
+    delete process.env.http_proxy;
+    delete process.env.HTTPS_PROXY;
+    delete process.env.HTTP_PROXY;
+
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    const settings: Settings = {};
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getProxy()).toBeFalsy();
+  });
+
+  const proxy_url = 'http://localhost:7890';
+  const testCases = [
+    {
+      input: {
+        env_name: 'https_proxy',
+        proxy_url,
+      },
+      expected: proxy_url,
+    },
+    {
+      input: {
+        env_name: 'http_proxy',
+        proxy_url,
+      },
+      expected: proxy_url,
+    },
+    {
+      input: {
+        env_name: 'HTTPS_PROXY',
+        proxy_url,
+      },
+      expected: proxy_url,
+    },
+    {
+      input: {
+        env_name: 'HTTP_PROXY',
+        proxy_url,
+      },
+      expected: proxy_url,
+    },
+  ];
+  testCases.forEach(({ input, expected }) => {
+    it(`should set proxy to ${expected} according to environment variable [${input.env_name}]`, async () => {
+      // Clear all proxy environment variables first
+      delete process.env.https_proxy;
+      delete process.env.http_proxy;
+      delete process.env.HTTPS_PROXY;
+      delete process.env.HTTP_PROXY;
+
+      process.env[input.env_name] = input.proxy_url;
+      process.argv = ['node', 'script.js'];
+      const argv = await parseArguments();
+      const settings: Settings = {};
+      const config = await loadCliConfig(settings, [], 'test-session', argv);
+      expect(config.getProxy()).toBe(expected);
+    });
+  });
+
+  it('should set proxy when --proxy flag is present', async () => {
+    process.argv = ['node', 'script.js', '--proxy', 'http://localhost:7890'];
+    const argv = await parseArguments();
+    const settings: Settings = {};
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getProxy()).toBe('http://localhost:7890');
+  });
+
+  it('should prioritize CLI flag over environment variable for proxy (CLI http://localhost:7890, environment variable http://localhost:7891)', async () => {
+    process.env['http_proxy'] = 'http://localhost:7891';
+    process.argv = ['node', 'script.js', '--proxy', 'http://localhost:7890'];
+    const argv = await parseArguments();
+    const settings: Settings = {};
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getProxy()).toBe('http://localhost:7890');
   });
 });
 
@@ -415,75 +455,6 @@ describe('loadCliConfig telemetry', () => {
     const config = await loadCliConfig(settings, [], 'test-session', argv);
     expect(config.getTelemetryLogPromptsEnabled()).toBe(true);
   });
-
-  it('should set enableOpenAILogging to true when --openai-logging flag is present', async () => {
-    const settings: Settings = {};
-    const argv = await parseArguments();
-    argv.openaiLogging = true;
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(
-      (
-        config as unknown as { getEnableOpenAILogging(): boolean }
-      ).getEnableOpenAILogging(),
-    ).toBe(true);
-  });
-
-  it('should set enableOpenAILogging to false when --openai-logging flag is not present', async () => {
-    const settings: Settings = {};
-    const argv = await parseArguments();
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(
-      (
-        config as unknown as { getEnableOpenAILogging(): boolean }
-      ).getEnableOpenAILogging(),
-    ).toBe(false);
-  });
-
-  it('should use enableOpenAILogging value from settings if CLI flag is not present (settings true)', async () => {
-    const settings: Settings = { enableOpenAILogging: true };
-    const argv = await parseArguments();
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(
-      (
-        config as unknown as { getEnableOpenAILogging(): boolean }
-      ).getEnableOpenAILogging(),
-    ).toBe(true);
-  });
-
-  it('should use enableOpenAILogging value from settings if CLI flag is not present (settings false)', async () => {
-    const settings: Settings = { enableOpenAILogging: false };
-    const argv = await parseArguments();
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(
-      (
-        config as unknown as { getEnableOpenAILogging(): boolean }
-      ).getEnableOpenAILogging(),
-    ).toBe(false);
-  });
-
-  it('should prioritize --openai-logging CLI flag (true) over settings (false)', async () => {
-    const settings: Settings = { enableOpenAILogging: false };
-    const argv = await parseArguments();
-    argv.openaiLogging = true;
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(
-      (
-        config as unknown as { getEnableOpenAILogging(): boolean }
-      ).getEnableOpenAILogging(),
-    ).toBe(true);
-  });
-
-  it('should prioritize --openai-logging CLI flag (false) over settings (true)', async () => {
-    const settings: Settings = { enableOpenAILogging: true };
-    const argv = await parseArguments();
-    argv.openaiLogging = false;
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(
-      (
-        config as unknown as { getEnableOpenAILogging(): boolean }
-      ).getEnableOpenAILogging(),
-    ).toBe(false);
-  });
 });
 
 describe('Hierarchical Memory Loading (config.ts) - Placeholder Suite', () => {
@@ -530,6 +501,7 @@ describe('Hierarchical Memory Loading (config.ts) - Placeholder Suite', () => {
     await loadCliConfig(settings, extensions, 'session-id', argv);
     expect(ServerConfig.loadServerHierarchicalMemory).toHaveBeenCalledWith(
       expect.any(String),
+      [],
       false,
       expect.any(Object),
       [
@@ -537,6 +509,12 @@ describe('Hierarchical Memory Loading (config.ts) - Placeholder Suite', () => {
         '/path/to/ext3/context1.md',
         '/path/to/ext3/context2.md',
       ],
+      'tree',
+      {
+        respectGitIgnore: false,
+        respectGeminiIgnore: true,
+      },
+      undefined, // maxDirs
     );
   });
 
@@ -591,6 +569,68 @@ describe('mergeMcpServers', () => {
     const argv = await parseArguments();
     await loadCliConfig(settings, extensions, 'test-session', argv);
     expect(settings).toEqual(originalSettings);
+  });
+});
+
+describe('loadCliConfig systemPromptMappings', () => {
+  it('should use default systemPromptMappings when not provided in settings', async () => {
+    const mockSettings: Settings = {
+      theme: 'dark',
+    };
+    const mockExtensions: Extension[] = [];
+    const mockSessionId = 'test-session';
+    const mockArgv: CliArgs = {
+      model: 'test-model',
+    } as CliArgs;
+
+    const config = await loadCliConfig(
+      mockSettings,
+      mockExtensions,
+      mockSessionId,
+      mockArgv,
+    );
+
+    expect(config.getSystemPromptMappings()).toEqual([
+      {
+        baseUrls: [
+          'https://dashscope.aliyuncs.com/compatible-mode/v1/',
+          'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/',
+        ],
+        modelNames: ['qwen3-coder-plus'],
+        template:
+          'SYSTEM_TEMPLATE:{"name":"qwen3_coder","params":{"is_git_repository":{RUNTIME_VARS_IS_GIT_REPO},"sandbox":"{RUNTIME_VARS_SANDBOX}"}}',
+      },
+    ]);
+  });
+
+  it('should use custom systemPromptMappings when provided in settings', async () => {
+    const customSystemPromptMappings = [
+      {
+        baseUrls: ['https://custom-api.com'],
+        modelNames: ['custom-model'],
+        template: 'Custom template',
+      },
+    ];
+    const mockSettings: Settings = {
+      theme: 'dark',
+      systemPromptMappings: customSystemPromptMappings,
+    };
+    const mockExtensions: Extension[] = [];
+    const mockSessionId = 'test-session';
+    const mockArgv: CliArgs = {
+      model: 'test-model',
+    } as CliArgs;
+
+    const config = await loadCliConfig(
+      mockSettings,
+      mockExtensions,
+      mockSessionId,
+      mockArgv,
+    );
+
+    expect(config.getSystemPromptMappings()).toEqual(
+      customSystemPromptMappings,
+    );
   });
 });
 
@@ -850,6 +890,66 @@ describe('loadCliConfig with allowed-mcp-server-names', () => {
     const config = await loadCliConfig(baseSettings, [], 'test-session', argv);
     expect(config.getMcpServers()).toEqual({});
   });
+
+  it('should read allowMCPServers from settings', async () => {
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    const settings: Settings = {
+      ...baseSettings,
+      allowMCPServers: ['server1', 'server2'],
+    };
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getMcpServers()).toEqual({
+      server1: { url: 'http://localhost:8080' },
+      server2: { url: 'http://localhost:8081' },
+    });
+  });
+
+  it('should read excludeMCPServers from settings', async () => {
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    const settings: Settings = {
+      ...baseSettings,
+      excludeMCPServers: ['server1', 'server2'],
+    };
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getMcpServers()).toEqual({
+      server3: { url: 'http://localhost:8082' },
+    });
+  });
+
+  it('should override allowMCPServers with excludeMCPServers if overlapping ', async () => {
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    const settings: Settings = {
+      ...baseSettings,
+      excludeMCPServers: ['server1'],
+      allowMCPServers: ['server1', 'server2'],
+    };
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getMcpServers()).toEqual({
+      server2: { url: 'http://localhost:8081' },
+    });
+  });
+
+  it('should prioritize mcp server flag if set ', async () => {
+    process.argv = [
+      'node',
+      'script.js',
+      '--allowed-mcp-server-names',
+      'server1',
+    ];
+    const argv = await parseArguments();
+    const settings: Settings = {
+      ...baseSettings,
+      excludeMCPServers: ['server1'],
+      allowMCPServers: ['server2'],
+    };
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    expect(config.getMcpServers()).toEqual({
+      server1: { url: 'http://localhost:8080' },
+    });
+  });
 });
 
 describe('loadCliConfig extensions', () => {
@@ -894,7 +994,69 @@ describe('loadCliConfig extensions', () => {
   });
 });
 
-describe('loadCliConfig ideMode', () => {
+describe('loadCliConfig model selection', () => {
+  it('selects a model from settings.json if provided', async () => {
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    const config = await loadCliConfig(
+      {
+        model: 'qwen3-coder-plus',
+      },
+      [],
+      'test-session',
+      argv,
+    );
+
+    expect(config.getModel()).toBe('qwen3-coder-plus');
+  });
+
+  it('uses the default gemini model if nothing is set', async () => {
+    process.argv = ['node', 'script.js']; // No model set.
+    const argv = await parseArguments();
+    const config = await loadCliConfig(
+      {
+        // No model set.
+      },
+      [],
+      'test-session',
+      argv,
+    );
+
+    expect(config.getModel()).toBe('qwen3-coder-plus');
+  });
+
+  it('always prefers model from argvs', async () => {
+    process.argv = ['node', 'script.js', '--model', 'qwen3-coder-plus'];
+    const argv = await parseArguments();
+    const config = await loadCliConfig(
+      {
+        model: 'qwen3-coder-plus',
+      },
+      [],
+      'test-session',
+      argv,
+    );
+
+    expect(config.getModel()).toBe('qwen3-coder-plus');
+  });
+
+  it('selects the model from argvs if provided', async () => {
+    process.argv = ['node', 'script.js', '--model', 'qwen3-coder-plus'];
+    const argv = await parseArguments();
+    const config = await loadCliConfig(
+      {
+        // No model provided via settings.
+      },
+      [],
+      'test-session',
+      argv,
+    );
+
+    expect(config.getModel()).toBe('qwen3-coder-plus');
+  });
+});
+
+describe('loadCliConfig ideModeFeature', () => {
   const originalArgv = process.argv;
   const originalEnv = { ...process.env };
 
@@ -902,9 +1064,8 @@ describe('loadCliConfig ideMode', () => {
     vi.resetAllMocks();
     vi.mocked(os.homedir).mockReturnValue('/mock/home/user');
     process.env.GEMINI_API_KEY = 'test-api-key';
-    // Explicitly delete TERM_PROGRAM and SANDBOX before each test
-    delete process.env.TERM_PROGRAM;
     delete process.env.SANDBOX;
+    delete process.env.GEMINI_CLI_IDE_SERVER_PORT;
   });
 
   afterEach(() => {
@@ -918,156 +1079,88 @@ describe('loadCliConfig ideMode', () => {
     const settings: Settings = {};
     const argv = await parseArguments();
     const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(false);
-  });
-
-  it('should be false if --ide-mode is true but TERM_PROGRAM is not vscode', async () => {
-    process.argv = ['node', 'script.js', '--ide-mode'];
-    const settings: Settings = {};
-    const argv = await parseArguments();
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(false);
-  });
-
-  it('should be false if settings.ideMode is true but TERM_PROGRAM is not vscode', async () => {
-    process.argv = ['node', 'script.js'];
-    const argv = await parseArguments();
-    const settings: Settings = { ideMode: true };
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(false);
-  });
-
-  it('should be true when --ide-mode is set and TERM_PROGRAM is vscode', async () => {
-    process.argv = ['node', 'script.js', '--ide-mode'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    const settings: Settings = {};
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(true);
-  });
-
-  it('should be true when settings.ideMode is true and TERM_PROGRAM is vscode', async () => {
-    process.argv = ['node', 'script.js'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    const settings: Settings = { ideMode: true };
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(true);
-  });
-
-  it('should prioritize --ide-mode (true) over settings (false) when TERM_PROGRAM is vscode', async () => {
-    process.argv = ['node', 'script.js', '--ide-mode'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    const settings: Settings = { ideMode: false };
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(true);
-  });
-
-  it('should prioritize --no-ide-mode (false) over settings (true) even when TERM_PROGRAM is vscode', async () => {
-    process.argv = ['node', 'script.js', '--no-ide-mode'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    const settings: Settings = { ideMode: true };
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(false);
-  });
-
-  it('should be false when --ide-mode is true, TERM_PROGRAM is vscode, but SANDBOX is set', async () => {
-    process.argv = ['node', 'script.js', '--ide-mode'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    process.env.SANDBOX = 'true';
-    const settings: Settings = {};
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(false);
-  });
-
-  it('should be false when settings.ideMode is true, TERM_PROGRAM is vscode, but SANDBOX is set', async () => {
-    process.argv = ['node', 'script.js'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    process.env.SANDBOX = 'true';
-    const settings: Settings = { ideMode: true };
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(false);
-  });
-
-  it('should add __ide_server when ideMode is true', async () => {
-    process.argv = ['node', 'script.js', '--ide-mode'];
-    const argv = await parseArguments();
-    process.env.TERM_PROGRAM = 'vscode';
-    const settings: Settings = {};
-    const config = await loadCliConfig(settings, [], 'test-session', argv);
-    expect(config.getIdeMode()).toBe(true);
-    const mcpServers = config.getMcpServers();
-    expect(mcpServers?.['_ide_server']).toBeDefined();
-    expect(mcpServers?.['_ide_server']?.httpUrl).toBe(
-      'http://localhost:3000/mcp',
-    );
-    expect(mcpServers?.['_ide_server']?.description).toBe('IDE connection');
-    expect(mcpServers?.['_ide_server']?.trust).toBe(false);
+    expect(config.getIdeModeFeature()).toBe(false);
   });
 });
 
-describe('loadCliConfig systemPromptMappings', () => {
-  it('should use default systemPromptMappings when not provided in settings', async () => {
-    const mockSettings: Settings = {
-      theme: 'dark',
-    };
-    const mockExtensions: Extension[] = [];
-    const mockSessionId = 'test-session';
-    const mockArgv: CliArgs = {
-      model: 'test-model',
-    } as CliArgs;
+vi.mock('fs', async () => {
+  const actualFs = await vi.importActual<typeof fs>('fs');
+  const MOCK_CWD1 = process.cwd();
+  const MOCK_CWD2 = path.resolve(path.sep, 'home', 'user', 'project');
 
-    const config = await loadCliConfig(
-      mockSettings,
-      mockExtensions,
-      mockSessionId,
-      mockArgv,
+  const mockPaths = new Set([
+    MOCK_CWD1,
+    MOCK_CWD2,
+    path.resolve(path.sep, 'cli', 'path1'),
+    path.resolve(path.sep, 'settings', 'path1'),
+    path.join(os.homedir(), 'settings', 'path2'),
+    path.join(MOCK_CWD2, 'cli', 'path2'),
+    path.join(MOCK_CWD2, 'settings', 'path3'),
+  ]);
+
+  return {
+    ...actualFs,
+    existsSync: vi.fn((p) => mockPaths.has(p.toString())),
+    statSync: vi.fn((p) => {
+      if (mockPaths.has(p.toString())) {
+        return { isDirectory: () => true };
+      }
+      // Fallback for other paths if needed, though the test should be specific.
+      return actualFs.statSync(p);
+    }),
+    realpathSync: vi.fn((p) => p),
+  };
+});
+
+describe('loadCliConfig with includeDirectories', () => {
+  const originalArgv = process.argv;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(os.homedir).mockReturnValue('/mock/home/user');
+    process.env.GEMINI_API_KEY = 'test-api-key';
+    vi.spyOn(process, 'cwd').mockReturnValue(
+      path.resolve(path.sep, 'home', 'user', 'project'),
     );
-
-    expect(config.getSystemPromptMappings()).toEqual([
-      {
-        baseUrls: [
-          'https://dashscope.aliyuncs.com/compatible-mode/v1/',
-          'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/',
-        ],
-        modelNames: ['qwen3-coder-plus'],
-        template:
-          'SYSTEM_TEMPLATE:{"name":"qwen3_coder","params":{"is_git_repository":{RUNTIME_VARS_IS_GIT_REPO},"sandbox":"{RUNTIME_VARS_SANDBOX}"}}',
-      },
-    ]);
   });
 
-  it('should use custom systemPromptMappings when provided in settings', async () => {
-    const customSystemPromptMappings = [
-      {
-        baseUrls: ['https://custom-api.com'],
-        modelNames: ['custom-model'],
-        template: 'Custom template',
-      },
+  afterEach(() => {
+    process.argv = originalArgv;
+    process.env = originalEnv;
+    vi.restoreAllMocks();
+  });
+
+  it('should combine and resolve paths from settings and CLI arguments', async () => {
+    const mockCwd = path.resolve(path.sep, 'home', 'user', 'project');
+    process.argv = [
+      'node',
+      'script.js',
+      '--include-directories',
+      `${path.resolve(path.sep, 'cli', 'path1')},${path.join(mockCwd, 'cli', 'path2')}`,
     ];
-    const mockSettings: Settings = {
-      theme: 'dark',
-      systemPromptMappings: customSystemPromptMappings,
+    const argv = await parseArguments();
+    const settings: Settings = {
+      includeDirectories: [
+        path.resolve(path.sep, 'settings', 'path1'),
+        path.join(os.homedir(), 'settings', 'path2'),
+        path.join(mockCwd, 'settings', 'path3'),
+      ],
     };
-    const mockExtensions: Extension[] = [];
-    const mockSessionId = 'test-session';
-    const mockArgv: CliArgs = {
-      model: 'test-model',
-    } as CliArgs;
-
-    const config = await loadCliConfig(
-      mockSettings,
-      mockExtensions,
-      mockSessionId,
-      mockArgv,
+    const config = await loadCliConfig(settings, [], 'test-session', argv);
+    const expected = [
+      mockCwd,
+      path.resolve(path.sep, 'cli', 'path1'),
+      path.join(mockCwd, 'cli', 'path2'),
+      path.resolve(path.sep, 'settings', 'path1'),
+      path.join(os.homedir(), 'settings', 'path2'),
+      path.join(mockCwd, 'settings', 'path3'),
+    ];
+    expect(config.getWorkspaceContext().getDirectories()).toEqual(
+      expect.arrayContaining(expected),
     );
-
-    expect(config.getSystemPromptMappings()).toEqual(
-      customSystemPromptMappings,
+    expect(config.getWorkspaceContext().getDirectories()).toHaveLength(
+      expected.length,
     );
   });
 });

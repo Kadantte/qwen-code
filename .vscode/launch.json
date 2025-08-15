@@ -31,6 +31,18 @@
       }
     },
     {
+      "name": "Launch Companion VS Code Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/vscode-ide-companion"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/vscode-ide-companion/dist/**/*.js"
+      ],
+      "preLaunchTask": "npm: build: vscode-ide-companion"
+    },
+    {
       "name": "Attach",
       "port": 9229,
       "request": "attach",
@@ -38,7 +50,7 @@
       "type": "node",
       // fix source mapping when debugging in sandbox using global installation
       // note this does not interfere when remoteRoot is also ${workspaceFolder}/packages
-      "remoteRoot": "/usr/local/share/npm-global/lib/node_modules/@gemini-cli",
+      "remoteRoot": "/usr/local/share/npm-global/lib/node_modules/@qwen-code",
       "localRoot": "${workspaceFolder}/packages"
     },
     {

@@ -17,7 +17,9 @@ import { Config } from '../config/config.js';
 vi.mock('../code_assist/codeAssist.js');
 vi.mock('@google/genai');
 
-const mockConfig = {} as unknown as Config;
+const mockConfig = {
+  getCliVersion: vi.fn().mockReturnValue('1.0.0'),
+} as unknown as Config;
 
 describe('createContentGenerator', () => {
   it('should create a CodeAssistContentGenerator', async () => {
@@ -64,12 +66,24 @@ describe('createContentGenerator', () => {
 
 describe('createContentGeneratorConfig', () => {
   const originalEnv = process.env;
+  const mockConfig = {
+    getModel: vi.fn().mockReturnValue('gemini-pro'),
+    setModel: vi.fn(),
+    flashFallbackHandler: vi.fn(),
+    getProxy: vi.fn(),
+    getEnableOpenAILogging: vi.fn().mockReturnValue(false),
+    getSamplingParams: vi.fn().mockReturnValue(undefined),
+    getContentGeneratorTimeout: vi.fn().mockReturnValue(undefined),
+    getContentGeneratorMaxRetries: vi.fn().mockReturnValue(undefined),
+    getCliVersion: vi.fn().mockReturnValue('1.0.0'),
+  } as unknown as Config;
 
   beforeEach(() => {
     // Reset modules to re-evaluate imports and environment variables
     vi.resetModules();
     // Restore process.env before each test
     process.env = { ...originalEnv };
+    vi.clearAllMocks();
   });
 
   afterAll(() => {
@@ -80,7 +94,7 @@ describe('createContentGeneratorConfig', () => {
   it('should configure for Gemini using GEMINI_API_KEY when set', async () => {
     process.env.GEMINI_API_KEY = 'env-gemini-key';
     const config = await createContentGeneratorConfig(
-      undefined,
+      mockConfig,
       AuthType.USE_GEMINI,
     );
     expect(config.apiKey).toBe('env-gemini-key');
@@ -90,7 +104,7 @@ describe('createContentGeneratorConfig', () => {
   it('should not configure for Gemini if GEMINI_API_KEY is empty', async () => {
     process.env.GEMINI_API_KEY = '';
     const config = await createContentGeneratorConfig(
-      undefined,
+      mockConfig,
       AuthType.USE_GEMINI,
     );
     expect(config.apiKey).toBeUndefined();
@@ -100,7 +114,7 @@ describe('createContentGeneratorConfig', () => {
   it('should configure for Vertex AI using GOOGLE_API_KEY when set', async () => {
     process.env.GOOGLE_API_KEY = 'env-google-key';
     const config = await createContentGeneratorConfig(
-      undefined,
+      mockConfig,
       AuthType.USE_VERTEX_AI,
     );
     expect(config.apiKey).toBe('env-google-key');
@@ -111,7 +125,7 @@ describe('createContentGeneratorConfig', () => {
     process.env.GOOGLE_CLOUD_PROJECT = 'env-gcp-project';
     process.env.GOOGLE_CLOUD_LOCATION = 'env-gcp-location';
     const config = await createContentGeneratorConfig(
-      undefined,
+      mockConfig,
       AuthType.USE_VERTEX_AI,
     );
     expect(config.vertexai).toBe(true);
@@ -123,7 +137,7 @@ describe('createContentGeneratorConfig', () => {
     process.env.GOOGLE_CLOUD_PROJECT = '';
     process.env.GOOGLE_CLOUD_LOCATION = '';
     const config = await createContentGeneratorConfig(
-      undefined,
+      mockConfig,
       AuthType.USE_VERTEX_AI,
     );
     expect(config.apiKey).toBeUndefined();
